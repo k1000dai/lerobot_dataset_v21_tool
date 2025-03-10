@@ -1,0 +1,6 @@
+**/__pycache__/
+**/datasets/
+**/tmp
+**/debug
+**/.vscode
+**/.DS_Store

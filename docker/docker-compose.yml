@@ -1,0 +1,37 @@
+version: "2.4"
+
+services:
+  hsr_data_converter:
+    image: hsr_data_converter:${TAG_NAME:-latest}  # Switch tag: If TAG_NAME is not set, use "latest"
+    container_name: ${CONTAINER_NAME:-hsr_data_converter}
+    # If you want to use GPU, uncomment the following line
+    # runtime: nvidia
+    privileged: true
+    environment:
+      # Enable GUI display via X Server.
+      - DISPLAY=${DISPLAY:-:0}
+      - GIT_HASH=${GIT_HASH:-}
+      - GIT_BRANCH=${GIT_BRANCH:-}
+      - QT_X11_NO_MITSHM=1
+      # Configure Nvidia Docker interface.
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - NVIDIA_REQUIRE_CUDA=cuda>=11.0
+    user: 0:0
+    build:
+      context: ./
+      dockerfile: ${DOCKERFILE:-./Dockerfile}
+    shm_size: '16gb'
+    volumes:
+      - ../:/root/hsr_data_converter
+      # Scripts and dataset directories.
+      - ./scripts:/root/scripts # Scripts directory.
+      - ${HSR_DATASET_DIR}:/root/datasets # Dataset directory.
+      # Grant display access to X Server.
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Match permissions
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+    working_dir: /root/hsr_data_converter
+    network_mode: host
+    entrypoint: ["/bin/bash"]

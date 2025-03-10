@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hsr-data-converter"
+version = "0.1.0"
+description = "Converts HSR rosbag data to lerobot dataset."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "lerobot==0.3.2",
+    "matplotlib>=3.10.1",
+    "natsort>=8.4.0",
+    "rosbags>=0.10.8",
+    "boto3>=1.37.10",
+    "airoa-metadata",
+]
+authors = [
+  {name = "Takuya Okubo", email = "tosimiti7@gmail.com"},
+  {name = "Makoto Sato", email = "makoto.sato@weblab.t.u-tokyo.ac.jp"},
+  {name = "Koya Sakamoto", email = "koya.sakamoto@weblab.t.u-tokyo.ac.jp"},
+  {name = "Ryosuke Takanami", email = "takanami@weblab.t.u-tokyo.ac.jp"}
+]
+
+[project.scripts]
+hsr-data-converter = "hsr_data_converter:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.16.0",
+    "pytest>=8.4.0",
+    "pytest-cov>=6.2.1",
+    "ruff>=0.11.13",
+    "boto3-stubs[essential]>=1.35.0",
+    "pandas-stubs>=2.0.0",
+]
+
+[tool.ruff]
+exclude = [
+    "src/hsr_data_converter/utils/transformations.py"
+]
+
+[tool.mypy]
+exclude = []
+disable_error_code = ["import-untyped"]
+
+[tool.uv.sources]
+airoa-metadata = { git = "https://github.com/airoa-org/airoa-metadata.git" }
