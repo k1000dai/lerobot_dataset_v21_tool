@@ -589,7 +589,8 @@ def copy_data_files(
     source_folders,
     output_folder,
     episode_mapping,
-    max_dim=18,
+    state_dim=None,
+    action_dim=None,
     fps=None,
     episode_to_frame_index=None,
     folder_to_task_strings=None,
@@ -604,7 +605,8 @@ def copy_data_files(
         source_folders (list): List of source dataset folder paths
         output_folder (str): Output folder path
         episode_mapping (list): List of tuples containing (old_folder, old_index, new_index)
-        max_dim (int): Maximum dimension for vectors
+        state_dim (int, optional): Target dimension for observation.state vectors
+        action_dim (int, optional): Target dimension for action vectors
         fps (float, optional): Frame rate, if not provided will be obtained from the first dataset
         episode_to_frame_index (dict, optional): Mapping of each new episode index to its starting frame index
         folder_to_task_strings (dict, optional): Mapping from folder path to its local (task_index -> task_string) map.
@@ -615,6 +617,44 @@ def copy_data_files(
     Returns:
         bool: Whether at least one file was successfully copied
     """
+    def pad_vector_columns(df):
+        """
+        Pad state/action columns to the target dimensions when provided.
+        """
+
+        def pad_column(column_name, target_dim):
+            if target_dim is None or column_name not in df.columns:
+                return
+
+            series = df[column_name]
+            first_vector = next(
+                (v for v in series if isinstance(v, (list, np.ndarray))), None
+            )
+            if first_vector is None:
+                return
+
+            current_dim = len(first_vector)
+            if current_dim == target_dim:
+                return
+
+            if current_dim > target_dim:
+                print(
+                    f"Warning: {column_name} dimension {current_dim} exceeds target {target_dim}, leaving unchanged."
+                )
+                return
+
+            pad_width = target_dim - current_dim
+            print(f"Padding {column_name} from {current_dim} to {target_dim}")
+            df[column_name] = series.apply(
+                lambda x: np.pad(x, (0, pad_width), "constant").tolist()
+                if isinstance(x, (list, np.ndarray)) and len(x) < target_dim
+                else x
+            )
+
+        pad_column("observation.state", state_dim)
+        pad_column("action", action_dim)
+        return df
+
     # Get FPS from first dataset if not provided
     if fps is None:
         info_path = os.path.join(source_folders[0], "meta", "info.json")
@@ -655,26 +695,8 @@ def copy_data_files(
                 # Read parquet file
                 df = pd.read_parquet(source_path)
 
-                # Check if dimensions need padding
-                # for feature in ["observation.state", "action"]:
-                #     if feature in df.columns:
-                #         # Check first non-null value
-                #         for _idx, value in enumerate(df[feature]):
-                #             if value is not None and isinstance(value, (list, np.ndarray)):
-                #                 current_dim = len(value)
-                #                 if current_dim < max_dim:
-                #                     print(
-                #                         f"Padding {feature} from {current_dim} to {max_dim} dimensions"
-                #                     )
-                #                     # Pad with zeros to target dimension
-                #                     df[feature] = df[feature].apply(
-                #                         lambda x: np.pad(x, (0, max_dim - len(x)), "constant").tolist()
-                #                         if x is not None
-                #                         and isinstance(x, (list, np.ndarray))
-                #                         and len(x) < max_dim
-                #                         else x
-                #                     )
-                #                 break
+                # Pad state/action dimensions if needed
+                df = pad_vector_columns(df)
 
                 # Update episode_index column
                 if "episode_index" in df.columns:
@@ -787,28 +809,7 @@ def copy_data_files(
                             # Read parquet file
                             df = pd.read_parquet(source_path)
 
-                            # Check if dimensions need padding
-                            # for feature in ["observation.state", "action"]:
-                            #     if feature in df.columns:
-                            #         # Check first non-null value
-                            #         for _idx, value in enumerate(df[feature]):
-                            #             if value is not None and isinstance(value, (list, np.ndarray)):
-                            #                 current_dim = len(value)
-                            #                 if current_dim < max_dim:
-                            #                     print(
-                            #                         f"Padding {feature} from {current_dim} to {max_dim} dimensions"
-                            #                     )
-                            #                     # Pad with zeros to target dimension
-                            #                     df[feature] = df[feature].apply(
-                            #                         lambda x: np.pad(
-                            #                             x, (0, max_dim - len(x)), "constant"
-                            #                         ).tolist()
-                            #                         if x is not None
-                            #                         and isinstance(x, (list, np.ndarray))
-                            #                         and len(x) < max_dim
-                            #                         else x
-                            #                     )
-                            #                 break
+                            df = pad_vector_columns(df)
 
                             # Update episode_index column
                             if "episode_index" in df.columns:
@@ -1038,7 +1039,7 @@ def merge_datasets(
     output_folder,
     validate_ts=False,
     tolerance_s=1e-4,
-    max_dim=18,
+    max_dim=None,
     default_fps=20,
 ):
     """
@@ -1049,7 +1050,7 @@ def merge_datasets(
         output_folder (str): Output folder path
         validate_ts (bool): Whether to validate timestamps
         tolerance_s (float): Tolerance for timestamp discontinuities in seconds
-        max_dim (int): Maximum dimension for vectors
+        max_dim (int, optional): Minimum target dimension for vector features (auto-detect when omitted)
         default_fps (float): Default frame rate
 
     This function performs the following operations:
@@ -1091,6 +1092,30 @@ def merge_datasets(
     task_string_to_new_index = {}
     all_unique_tasks = []
 
+    def get_dim_from_info(info_dict, feature_name):
+        try:
+            shape = info_dict.get("features", {}).get(feature_name, {}).get("shape")
+        except AttributeError:
+            return None
+
+        if isinstance(shape, list) and shape:
+            try:
+                return int(shape[0])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def detect_dim_from_df(df, column_name):
+        if column_name not in df.columns:
+            return None
+
+        first_vector = next(
+            (v for v in df[column_name] if isinstance(v, (list, np.ndarray))), None
+        )
+        if first_vector is not None:
+            return len(first_vector)
+        return None
+
     # First, build the mappings from tasks across all datasets
     for folder in source_folders:
         tasks_path = os.path.join(folder, "meta", "tasks.jsonl")
@@ -1120,8 +1145,9 @@ def merge_datasets(
     # Collect all stats for proper merging
     all_stats_data = []
 
-    # Track dimensions for each folder
-    folder_dimensions = {}
+    # Track detected vector dimensions
+    detected_state_dims = []
+    detected_action_dims = []
 
     # Add a variable to track cumulative frames
     cumulative_frame_count = 0
@@ -1141,6 +1167,8 @@ def merge_datasets(
         try:
             # Get total_videos directly from each dataset's info.json
             folder_info_path = os.path.join(folder, "meta", "info.json")
+            folder_state_dim = None
+            folder_action_dim = None
             if os.path.exists(folder_info_path):
                 with open(folder_info_path) as f:
                     folder_info = json.load(f)
@@ -1151,32 +1179,45 @@ def merge_datasets(
                             f"Read video count from {folder}'s info.json: {folder_videos}"
                         )
 
-            # Check dimensions of state vectors in this folder
-            folder_dim = max_dim  # Use variable instead of hardcoded 18
+                    folder_state_dim = get_dim_from_info(
+                        folder_info, "observation.state"
+                    )
+                    folder_action_dim = get_dim_from_info(folder_info, "action")
 
-            # Try to find a parquet file to determine dimensions
+            # Try to find a parquet file to determine dimensions when metadata is missing
+            sample_parquet = None
             for root, _dirs, files in os.walk(folder):
                 for file in files:
                     if file.endswith(".parquet"):
-                        try:
-                            df = pd.read_parquet(os.path.join(root, file))
-                            if "observation.state" in df.columns:
-                                first_state = df["observation.state"].iloc[0]
-                                if isinstance(first_state, (list, np.ndarray)):
-                                    folder_dim = len(first_state)
-                                    print(
-                                        f"Detected {folder_dim} dimensions in {folder}"
-                                    )
-                                    break
-                        except Exception as e:
-                            print(f"Error checking dimensions in {folder}: {e}")
+                        sample_parquet = os.path.join(root, file)
                         break
-                if folder_dim != max_dim:  # Use variable instead of hardcoded 18
+                if sample_parquet:
                     break
 
-            folder_dimensions[folder] = (
-                folder_dim  # source_folderをkeyとして, valueには状態のdimを保存
-            )
+            if sample_parquet and (folder_state_dim is None or folder_action_dim is None):
+                try:
+                    columns = []
+                    if folder_state_dim is None:
+                        columns.append("observation.state")
+                    if folder_action_dim is None:
+                        columns.append("action")
+                    df = pd.read_parquet(
+                        sample_parquet, columns=columns if columns else None
+                    )
+                except Exception:
+                    df = pd.read_parquet(sample_parquet)
+
+                if folder_state_dim is None:
+                    folder_state_dim = detect_dim_from_df(df, "observation.state")
+                if folder_action_dim is None:
+                    folder_action_dim = detect_dim_from_df(df, "action")
+
+            if folder_state_dim is not None:
+                detected_state_dims.append(folder_state_dim)
+                print(f"Detected observation.state dim {folder_state_dim} in {folder}")
+            if folder_action_dim is not None:
+                detected_action_dims.append(folder_action_dim)
+                print(f"Detected action dim {folder_action_dim} in {folder}")
 
             # Load episodes
             episodes_path = os.path.join(folder, "meta", "episodes.jsonl")
@@ -1212,26 +1253,6 @@ def merge_datasets(
                     stats = stats_map[old_index]
                     stats["episode_index"] = new_index
 
-                    # # Pad stats data if needed
-                    # if "stats" in stats and folder_dimensions[folder] < max_dim:  # Use variable instead of hardcoded 18
-                    #     # Pad observation.state and action stats
-                    #     for feature in ["observation.state", "action"]:
-                    #         if feature in stats["stats"]:
-                    #             for stat_type in ["mean", "std", "max", "min"]:
-                    #                 if stat_type in stats["stats"][feature]:
-                    #                     # Get current values
-                    #                     values = stats["stats"][feature][stat_type]
-
-                    #                     # Check if it's a list/array that needs padding
-                    #                     if (
-                    #                         isinstance(values, list) and len(values) < max_dim
-                    #                     ):  # Use variable instead of hardcoded 18
-                    #                         # Pad with zeros
-                    #                         padded = values + [0.0] * (
-                    #                             max_dim - len(values)
-                    #                         )  # Use variable instead of hardcoded 18
-                    #                         stats["stats"][feature][stat_type] = padded
-
                     all_episodes_stats.append(stats)
 
                     # Add to all_stats_data for proper merging
@@ -1254,6 +1275,45 @@ def merge_datasets(
             continue
 
     print(f"Processed {total_episodes} episodes from {len(source_folders)} folders")
+
+    state_dim_candidates = [dim for dim in detected_state_dims if dim is not None]
+    action_dim_candidates = [dim for dim in detected_action_dims if dim is not None]
+
+    if max_dim is not None:
+        state_dim_candidates.append(max_dim)
+        action_dim_candidates.append(max_dim)
+
+    target_state_dim = max(state_dim_candidates) if state_dim_candidates else None
+    target_action_dim = max(action_dim_candidates) if action_dim_candidates else None
+
+    if target_state_dim is not None:
+        print(f"Target observation.state dimension: {target_state_dim}")
+    if target_action_dim is not None:
+        print(f"Target action dimension: {target_action_dim}")
+
+    def pad_episode_stats(entry, feature_name, target_dim):
+        if target_dim is None:
+            return
+
+        stats = entry.get("stats")
+        if not stats or feature_name not in stats:
+            return
+
+        for stat_key in ["mean", "std", "max", "min"]:
+            if stat_key in stats[feature_name]:
+                values = np.array(stats[feature_name][stat_key]).flatten()
+                if len(values) < target_dim:
+                    padded = np.zeros(target_dim)
+                    padded[: len(values)] = values
+                    stats[feature_name][stat_key] = padded.tolist()
+                elif len(values) > target_dim:
+                    print(
+                        f"Warning: {feature_name}.{stat_key} in episode stats has dimension {len(values)} exceeding target {target_dim}"
+                    )
+
+    for stat_entry in all_episodes_stats:
+        pad_episode_stats(stat_entry, "observation.state", target_state_dim)
+        pad_episode_stats(stat_entry, "action", target_action_dim)
 
     # Save combined episodes and stats
     save_jsonl(all_episodes, os.path.join(output_folder, "meta", "episodes.jsonl"))
@@ -1286,7 +1346,7 @@ def merge_datasets(
                     ]
 
                     # Find the maximum dimension for this feature
-                    max_dim = max(
+                    feature_dim = max(
                         len(np.array(val.get("mean", [0])).flatten())
                         for val in values
                         if "mean" in val
@@ -1311,8 +1371,8 @@ def merge_datasets(
                         for val in values:
                             val_array = np.array(val["min"])
                             val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
+                            if len(val_flat) < feature_dim:
+                                padded = np.zeros(feature_dim)
                                 padded[: len(val_flat)] = val_flat
                                 padded_mins.append(padded)
                             else:
@@ -1329,8 +1389,8 @@ def merge_datasets(
                         for val in values:
                             val_array = np.array(val["max"])
                             val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
+                            if len(val_flat) < feature_dim:
+                                padded = np.zeros(feature_dim)
                                 padded[: len(val_flat)] = val_flat
                                 padded_maxs.append(padded)
                             else:
@@ -1348,8 +1408,8 @@ def merge_datasets(
                         for val in values:
                             val_array = np.array(val["mean"])
                             val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
+                            if len(val_flat) < feature_dim:
+                                padded = np.zeros(feature_dim)
                                 padded[: len(val_flat)] = val_flat
                                 padded_means.append(padded)
                             else:
@@ -1380,8 +1440,8 @@ def merge_datasets(
                         for val in values:
                             val_array = np.array(val["std"])
                             val_flat = val_array.flatten()
-                            if len(val_flat) < max_dim:
-                                padded = np.zeros(max_dim)
+                            if len(val_flat) < feature_dim:
+                                padded = np.zeros(feature_dim)
                                 padded[: len(val_flat)] = val_flat
                                 padded_stds.append(padded)
                             else:
@@ -1404,6 +1464,25 @@ def merge_datasets(
                                 padded_stds, axis=0
                             ).tolist()
 
+        def pad_stats_feature(feature_name, target_dim):
+            if target_dim is None or feature_name not in merged_stats:
+                return
+
+            for stat_key in ["mean", "std", "max", "min"]:
+                if stat_key in merged_stats[feature_name]:
+                    values = np.array(merged_stats[feature_name][stat_key]).flatten()
+                    if len(values) < target_dim:
+                        padded = np.zeros(target_dim)
+                        padded[: len(values)] = values
+                        merged_stats[feature_name][stat_key] = padded.tolist()
+                    elif len(values) > target_dim:
+                        print(
+                            f"Warning: {feature_name}.{stat_key} dimension {len(values)} exceeds target {target_dim}"
+                        )
+
+        pad_stats_feature("observation.state", target_state_dim)
+        pad_stats_feature("action", target_action_dim)
+
         with open(os.path.join(output_folder, "meta", "stats.json"), "w") as f:
             json.dump(merged_stats, f, indent=4)
 
@@ -1423,21 +1502,28 @@ def merge_datasets(
     # Update splits
     info["splits"] = {"train": f"0:{total_episodes}"}
 
-    # Update feature dimensions to the maximum dimension
+    # Update feature dimensions based on detected targets
     if "features" in info:
-        # Find the maximum dimension across all folders
-        actual_max_dim = max_dim  # Use variable instead of hardcoded 18
-        for _folder, dim in folder_dimensions.items():
-            actual_max_dim = max(actual_max_dim, dim)
+        if target_state_dim is None:
+            target_state_dim = get_dim_from_info(info, "observation.state")
+        if target_action_dim is None:
+            target_action_dim = get_dim_from_info(info, "action")
 
-        # Update observation.state and action dimensions
-        for feature_name in ["observation.state", "action"]:
-            if (
-                feature_name in info["features"]
-                and "shape" in info["features"][feature_name]
-            ):
-                info["features"][feature_name]["shape"] = [actual_max_dim]
-                print(f"Updated {feature_name} shape to {actual_max_dim}")
+        if (
+            target_state_dim is not None
+            and "observation.state" in info["features"]
+            and "shape" in info["features"]["observation.state"]
+        ):
+            info["features"]["observation.state"]["shape"] = [target_state_dim]
+            print(f"Updated observation.state shape to {target_state_dim}")
+
+        if (
+            target_action_dim is not None
+            and "action" in info["features"]
+            and "shape" in info["features"]["action"]
+        ):
+            info["features"]["action"]["shape"] = [target_action_dim]
+            print(f"Updated action shape to {target_action_dim}")
 
     # Update total videos
     info["total_videos"] = total_videos
@@ -1452,7 +1538,8 @@ def merge_datasets(
         source_folders,
         output_folder,
         episode_mapping,
-        max_dim=max_dim,
+        state_dim=target_state_dim,
+        action_dim=target_action_dim,
         fps=fps,
         episode_to_frame_index=episode_to_frame_index,
         folder_to_task_strings=folder_to_task_strings,
@@ -1477,7 +1564,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output", required=True, help="Output folder path")
     parser.add_argument(
-        "--max_dim", type=int, default=32, help="Maximum dimension (default: 32)"
+        "--max_dim",
+        type=int,
+        default=None,
+        help="Optional minimum vector dimension (auto-detect when omitted)",
     )
     parser.add_argument(
         "--fps", type=int, default=10, help="Your datasets FPS (default: 20)"
